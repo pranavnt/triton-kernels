@@ -9,10 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
-from triton_kernels.utils import create_test_matrix, benchmark_kernel, print_results
-from triton_kernels.transpose.v0 import verify_transpose
+import pdb
 
-BLOCK_SIZE = 64
+from triton_kernels.utils import create_test_matrix, benchmark_kernel, print_results
+from triton_kernels.transpose.v0 import verify_transpose, transpose_v0
+
+BLOCK_SIZE = 32
 
 @triton.jit
 def transpose_kernel(
@@ -20,36 +22,59 @@ def transpose_kernel(
   Y_ptr,
   num_rows,
   num_cols,
+  stride_x,
+  stride_y,
   BLOCK_SIZE: tl.constexpr,
 ):
   pid = tl.program_id(0)
 
-  block_start = pid * BLOCK_SIZE
-  offsets = block_start + tl.arange(0, BLOCK_SIZE)
-  mask = offsets < num_rows
-  x = tl.load(X_ptr + offsets[mask], mask=mask)
+  num_col_blocks = (num_cols + BLOCK_SIZE - 1) // BLOCK_SIZE
+  row_idx = pid // num_col_blocks
+  col_block_idx = pid % num_col_blocks
 
-  offsets = block_start + tl.arange(0, BLOCK_SIZE)
-  mask = offsets < num_cols
-  tl.store(Y_ptr + offsets[mask], x, mask=mask)
+  col_start = col_block_idx * BLOCK_SIZE
+  col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+  col_mask = col_offsets < num_cols
 
-def transpose(x):
-  num_rows, num_cols = x.shape
-  output = torch.empty((num_cols, num_rows), device=x.device, dtype=x.dtype)
-  grid = torch.zeros(triton.cdiv(num_rows, BLOCK_SIZE), device=x.device)
-  transpose_kernel[grid](x, output, num_rows, num_cols, BLOCK_SIZE=BLOCK_SIZE)
-  return output
+  x_ptr = X_ptr + row_idx * stride_x + col_offsets
+  row_chunk = tl.load(x_ptr, mask=col_mask)
+
+  y_ptr = Y_ptr + col_offsets * stride_y + row_idx
+  tl.store(y_ptr, row_chunk, mask=col_mask)
+
+def transpose_v1(x):
+    num_rows, num_cols = x.shape
+
+    stride_x = x.stride(0)
+    stride_y = num_rows
+
+    num_col_blocks = (num_cols + BLOCK_SIZE - 1) // BLOCK_SIZE
+    grid = (num_rows * num_col_blocks,)
+
+    output = torch.empty((num_cols, num_rows), device=x.device, dtype=x.dtype)
+
+    transpose_kernel[grid](
+      x, output,
+      num_rows, num_cols,
+      stride_x, stride_y,
+      BLOCK_SIZE=BLOCK_SIZE
+    )
+
+    return output
 
 if __name__ == "__main__":
   matrices = create_test_matrix(torch.float32, torch.device("cuda"))
 
+  # for matrix in [torch.randn(9183, 9183, device="cuda")]:
   for matrix in matrices:
     correct = matrix.t().contiguous()
-    y = transpose(matrix)
-    assert torch.allclose(correct, y)
+    y = transpose_v1(matrix)
+    print(f"Checking matrix with shape: {matrix.shape}")
+    print("Max diff: ", torch.max(torch.abs(correct - y)))
+    print("avg diff: ", torch.mean(torch.abs(correct - y)))
+    print("allclose: ", torch.allclose(correct, y))
 
-  # kernels = [transpose]
-  # results = benchmark_kernel(kernels, matrices)
-  # print_results(results)
-
-  x
+  # benchmark
+  kernels = [transpose_v1]
+  results = benchmark_kernel(kernels, matrices)
+  print_results(results)
