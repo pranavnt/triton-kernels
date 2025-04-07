@@ -40,6 +40,7 @@ def transpose_kernel(
   row_chunk = tl.load(x_ptr, mask=col_mask)
 
   y_ptr = Y_ptr + col_offsets * stride_y + row_idx
+
   tl.store(y_ptr, row_chunk, mask=col_mask)
 
 def transpose_v1(x):
@@ -65,7 +66,7 @@ def transpose_v1(x):
 if __name__ == "__main__":
   matrices = create_test_matrix(torch.float32, torch.device("cuda"))
 
-  # for matrix in [torch.randn(9183, 9183, device="cuda")]:
+  # for matrix in [torch.randn(64, 64, device="cuda")]:
   for matrix in matrices:
     correct = matrix.t().contiguous()
     y = transpose_v1(matrix)
@@ -73,6 +74,7 @@ if __name__ == "__main__":
     print("Max diff: ", torch.max(torch.abs(correct - y)))
     print("avg diff: ", torch.mean(torch.abs(correct - y)))
     print("allclose: ", torch.allclose(correct, y))
+    # break
 
   # benchmark
   kernels = [transpose_v1]
