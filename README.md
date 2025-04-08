@@ -796,3 +796,402 @@ def benchmark(M, N, K, provider):
 **V4: Auto-tuning**
 - Implement auto-tuning on block-sizes, and other parameters to make things fast across matrix sizes
 - Benchmark against Pytorch for various matrix sizes
+
+
+# CUDA Programming Study Guide
+Based on your request, I'll provide a comprehensive guide on CUDA programming concepts and syntax that will help you understand how to write the kernels needed for your assignment. This guide won't provide direct solutions but will equip you with the knowledge needed to implement the required functionality.
+## 1. CUDA Programming Model
+### Core Concepts
+- **Host**: The CPU and its memory
+- **Device**: The GPU and its memory
+- **Kernel**: Function that runs on the GPU
+- **Thread**: Basic unit of execution on the GPU
+- **Warp**: Group of 32 threads that execute in SIMT (Single Instruction, Multiple Thread) fashion
+- **Block**: Group of threads that can communicate via shared memory
+- **Grid**: Collection of blocks that make up a kernel launch
+### Memory Hierarchy
+- **Register Memory**: Fastest, private to each thread (tens of KB per SM)
+- **Shared Memory**: Fast memory shared among threads in a block (~100KB per SM)
+- **L1/L2 Cache**: Hardware-managed caches
+- **Global Memory**: Largest but slowest memory, accessible by all threads (several GB)
+## 2. CUDA Syntax Basics
+### Kernel Definition
+```cuda
+__global__ void myKernel(float* input, float* output, int size) {
+    // Code executed on the GPU
+}
+```
+Key qualifiers:
+- `__global__`: Function runs on the device, callable from host
+- `__device__`: Function runs on the device, callable only from device
+- `__host__`: Function runs on the host (default if no qualifier)
+### Kernel Launch
+```cuda
+// Define grid dimensions
+dim3 blockDim(256);  // Threads per block
+dim3 gridDim((size + blockDim.x - 1) / blockDim.x);  // Number of blocks
+
+// Launch kernel
+myKernel<<<gridDim, blockDim>>>(d_input, d_output, size);
+```
+### Thread Indexing
+```cuda
+// Within a kernel:
+int threadId = threadIdx.x;  // Thread ID within block (x dimension)
+int blockId = blockIdx.x;    // Block ID (x dimension)
+int globalId = blockIdx.x * blockDim.x + threadIdx.x;  // Global thread ID
+```
+### Multi-dimensional Thread Organization
+```cuda
+// 2D indexing
+int row = blockIdx.y * blockDim.y + threadIdx.y;
+int col = blockIdx.x * blockDim.x + threadIdx.x;
+int idx = row * width + col;  // Linear index for 2D data
+```
+## 3. Memory Management
+### Allocation and Deallocation
+```cuda
+// Device memory allocation
+float *d_array;
+cudaMalloc((void**)&d_array, size * sizeof(float));
+
+// Device memory deallocation
+cudaFree(d_array);
+
+// Host memory allocation (pinned memory for faster transfers)
+float *h_array;
+cudaMallocHost((void**)&h_array, size * sizeof(float));
+// or standard allocation
+float *h_array = (float*)malloc(size * sizeof(float));
+
+// Host memory deallocation
+cudaFreeHost(h_array);  // For pinned memory
+// or standard deallocation
+free(h_array);
+```
+
+### Data Transfer
+
+```cuda
+// Host to device transfer
+cudaMemcpy(d_array, h_array, size * sizeof(float), cudaMemcpyHostToDevice);
+
+// Device to host transfer
+cudaMemcpy(h_array, d_array, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+// Device to device transfer
+cudaMemcpy(d_dst, d_src, size * sizeof(float), cudaMemcpyDeviceToDevice);
+
+// Asynchronous transfer
+cudaMemcpyAsync(d_array, h_array, size * sizeof(float),
+                cudaMemcpyHostToDevice, stream);
+```
+
+### Shared Memory
+
+```cuda
+__global__ void sharedMemKernel(float* input, float* output, int size) {
+    // Static shared memory declaration
+    __shared__ float sharedData[256];
+
+    // Or dynamic shared memory (size determined at kernel launch)
+    extern __shared__ float dynamicShared[];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data into shared memory
+    if (idx < size) {
+        sharedData[threadIdx.x] = input[idx];
+    }
+
+    // Synchronize threads in block
+    __syncthreads();
+
+    // Use shared data
+    if (idx < size) {
+        output[idx] = sharedData[threadIdx.x] * 2.0f;
+    }
+}
+
+// Launch with dynamic shared memory
+sharedMemKernel<<<gridDim, blockDim, sharedMemSize>>>(d_input, d_output, size);
+```
+
+## 4. Parallel Patterns
+
+### Vector Addition
+
+```cuda
+__global__ void vectorAdd(float* a, float* b, float* c, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
+```
+
+### Matrix Transpose
+
+```cuda
+__global__ void naiveTranspose(float* input, float* output, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < rows * cols) {
+        int row = idx / cols;
+        int col = idx % cols;
+        output[col * rows + row] = input[row * cols + col];
+    }
+}
+```
+
+### Optimized Matrix Transpose with Shared Memory
+
+```cuda
+__global__ void sharedTranspose(float* input, float* output, int rows, int cols) {
+    __shared__ float tile[TILE_SIZE][TILE_SIZE + 1]; // +1 to avoid bank conflicts
+
+    int x = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int y = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    // Load data into shared memory
+    if (x < cols && y < rows) {
+        tile[threadIdx.y][threadIdx.x] = input[y * cols + x];
+    }
+
+    __syncthreads();
+
+    // Calculate transposed coordinates
+    x = blockIdx.y * TILE_SIZE + threadIdx.x;
+    y = blockIdx.x * TILE_SIZE + threadIdx.y;
+
+    // Write transposed data
+    if (x < rows && y < cols) {
+        output[y * rows + x] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+```
+
+### Reduction
+
+```cuda
+__global__ void reduction(float* input, float* output, int size) {
+    __shared__ float sdata[BLOCK_SIZE];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data into shared memory
+    sdata[tid] = (idx < size) ? input[idx] : 0;
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Write result for this block
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
+```
+
+## 5. Optimization Techniques
+
+### Coalesced Memory Access
+
+- Access pattern where consecutive threads access consecutive memory locations
+- Critical for performance as it allows for efficient memory transactions
+
+```cuda
+// Good: Coalesced access
+int idx = blockIdx.x * blockDim.x + threadIdx.x;
+float value = input[idx];  // Consecutive threads access consecutive elements
+
+// Bad: Strided access
+int idx = threadIdx.x * stride + blockIdx.x;
+float value = input[idx];  // Threads access memory with stride gaps
+```
+
+### Bank Conflicts in Shared Memory
+
+- Shared memory is divided into 32 banks (one for each thread in a warp)
+- Bank conflicts occur when multiple threads in a warp access the same bank
+- Avoid by using padding in shared memory declarations
+
+```cuda
+// With potential bank conflicts
+__shared__ float sharedMem[TILE_SIZE][TILE_SIZE];
+
+// Avoiding bank conflicts with padding
+__shared__ float sharedMem[TILE_SIZE][TILE_SIZE + 1];
+```
+
+### Thread Divergence
+
+- Occurs when threads in the same warp take different execution paths
+- Minimize conditional statements that depend on thread ID
+
+```cuda
+// High divergence (bad)
+if (threadIdx.x % 2 == 0) {
+    // Half of threads do this
+} else {
+    // Half of threads do that
+}
+
+// Less divergence (better)
+if (blockIdx.x % 2 == 0) {
+    // All threads in the block do this
+} else {
+    // All threads in the block do that
+}
+```
+
+### Loop Unrolling
+
+```cuda
+// Instead of:
+for (int i = 0; i < 4; i++) {
+    result += input[idx + i];
+}
+
+// Unroll to:
+result += input[idx];
+result += input[idx + 1];
+result += input[idx + 2];
+result += input[idx + 3];
+```
+
+### Occupancy
+
+- Ratio of active warps to maximum possible warps on an SM
+- Affected by register usage, shared memory usage, and block size
+- Higher occupancy often leads to better performance by hiding latency
+
+## 6. Error Handling
+
+```cuda
+// Check for errors after kernel launch
+cudaError_t err = cudaGetLastError();
+if (err != cudaSuccess) {
+    printf("CUDA Error: %s\n", cudaGetErrorString(err));
+    // Handle error
+}
+
+// Check for asynchronous errors
+cudaDeviceSynchronize();
+err = cudaGetLastError();
+if (err != cudaSuccess) {
+    printf("CUDA Error: %s\n", cudaGetErrorString(err));
+    // Handle error
+}
+```
+
+## 7. Implementation for Your Assignment
+
+Based on your code files, here are the key implementations you'll need:
+
+### 1. SiLU Activation Function
+
+```cuda
+// In silu.cu
+__device__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void silu_kernel(float* input, float* output, int n) {
+    // TODO: Implement SiLU: x * sigmoid(x)
+}
+
+void silu(float* input, float* output, int n) {
+    // TODO: Set up grid and block dimensions, launch kernel
+}
+
+// In main.cu
+int main() {
+    // TODO: Set up memory, launch kernel, verify results
+}
+```
+
+### 2. RMS Normalization (Vector)
+
+```cuda
+// In rms_norm_vector.cu
+__global__ void rms_norm_vector_kernel(float* input, float* weight, float* output,
+                                      int cols, float epsilon) {
+    // TODO: Implement RMS normalization for vectors
+    // 1. Calculate sum of squares
+    // 2. Calculate RMS (root mean square)
+    // 3. Normalize and scale by weight
+}
+
+void rms_norm_vector(float* input, float* weight, float* output,
+                     int cols, float epsilon) {
+    // TODO: Set up grid and block dimensions, launch kernel
+}
+
+// In main.cu
+int main() {
+    // TODO: Set up memory, launch kernel, verify results
+}
+```
+
+### 3. RMS Normalization (Matrix)
+
+```cuda
+// In rms_norm_matrix.cu
+__global__ void rms_norm_matrix_kernel(float* input, float* weight, float* output,
+                                      int rows, int cols, float epsilon) {
+    // TODO: Implement RMS normalization for matrices
+    // Process each row independently
+}
+
+void rms_norm_matrix(float* input, float* weight, float* output,
+                     int rows, int cols, float epsilon) {
+    // TODO: Set up grid and block dimensions, launch kernel
+}
+
+// In main.cu
+int main() {
+    // TODO: Set up memory, launch kernel, verify results
+}
+```
+
+### 4. Copy First Column
+
+```cuda
+// In copy_first_column.cu
+void copy_first_column(float* h_A, float* d_A, int rows, int cols) {
+    // TODO: Implement copying first column from host to device
+    // Options:
+    // 1. Use cudaMemcpy for each element
+    // 2. Create a temporary array and batch the copy
+}
+
+// In main.cu
+int main() {
+    // TODO: Set up memory, call function, verify results
+}
+```
+
+## 8. Performance Considerations
+
+1. **Memory Throughput**: Global memory bandwidth is often the bottleneck. Use coalesced access patterns and shared memory to reduce global memory traffic.
+
+2. **Arithmetic Intensity**: Ratio of arithmetic operations to memory operations. Higher values generally indicate better performance.
+
+3. **Occupancy**: Aim for high SM occupancy by balancing resources (registers, shared memory) and block size.
+
+4. **Latency Hiding**: Use enough threads to hide memory and instruction latency.
+
+5. **Synchronization**: Minimize `__syncthreads()` calls as they can stall execution.
+
+6. **Divergence**: Minimize thread divergence by designing algorithms with uniform control flow.
+
+7. **Block Size**: Choose block sizes that are multiples of 32 (warp size) for best performance.
+
+
+By applying these concepts and techniques, you should be able to implement efficient CUDA kernels for the functions required in your assignment. Remember that optimization is an iterative process - start with a simple working implementation, then optimize for performance.
